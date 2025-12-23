@@ -48,59 +48,65 @@
             const [messages, setMessages] = useState(savedMessages);
             const [inputText, setInputText] = useState('');
             
-            // Modals
             const [showConnectModal, setShowConnectModal] = useState(false);
             const [showServerModal, setShowServerModal] = useState(false);
             const [showProfileModal, setShowProfileModal] = useState(false);
             
-            // WebRTC State
             const [connState, setConnState] = useState('disconnected');
             const [sdpData, setSdpData] = useState(savedSdp);
             const [remoteSdp, setRemoteSdp] = useState(savedRemoteSdp);
             const [copySuccess, setCopySuccess] = useState(false);
             
-            // Voice State
             const [isJoiningVoice, setIsJoiningVoice] = useState(false);
             const [isInVoiceRoom, setIsInVoiceRoom] = useState(false);
-            const [isMicMuted, setIsMicMuted] = useState(false);
 
             const pc = useRef(null);
             const dataChannel = useRef(null);
             const localStream = useRef(null);
             const remoteAudio = useRef(new Audio());
 
-            // Save data
             useEffect(() => { localStorage.setItem('p2p-username', username); }, [username]);
             useEffect(() => { localStorage.setItem('p2p-messages', JSON.stringify(messages)); }, [messages]);
             useEffect(() => { localStorage.setItem('p2p-servers', JSON.stringify(servers)); }, [servers]);
             useEffect(() => { localStorage.setItem('p2p-local-sdp', sdpData); }, [sdpData]);
             useEffect(() => { localStorage.setItem('p2p-remote-sdp', remoteSdp); }, [remoteSdp]);
 
-            // WebRTC Logic
             const initPeer = () => {
                 if (pc.current) return;
-                pc.current = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
                 
-                pc.current.onicecandidate = (e) => {
-                    if (!e.candidate) setSdpData(JSON.stringify(pc.current.localDescription));
-                };
+                try {
+                    pc.current = new RTCPeerConnection({ 
+                        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] 
+                    });
+                    
+                    pc.current.onicecandidate = (e) => {
+                        if (!e.candidate && pc.current.localDescription) {
+                            setSdpData(JSON.stringify(pc.current.localDescription));
+                        }
+                    };
 
-                pc.current.ondatachannel = (e) => {
-                    dataChannel.current = e.channel;
-                    setupChannel(e.channel);
-                };
+                    pc.current.ondatachannel = (e) => {
+                        dataChannel.current = e.channel;
+                        setupChannel(e.channel);
+                    };
 
-                pc.current.ontrack = (e) => {
-                    remoteAudio.current.srcObject = e.streams[0];
-                    remoteAudio.current.play();
-                    setIsInVoiceRoom(true);
-                };
+                    pc.current.ontrack = (e) => {
+                        remoteAudio.current.srcObject = e.streams[0];
+                        remoteAudio.current.play().catch(console.error);
+                        setIsInVoiceRoom(true);
+                    };
 
-                pc.current.onconnectionstatechange = () => setConnState(pc.current.connectionState);
+                    pc.current.onconnectionstatechange = () => {
+                        setConnState(pc.current.connectionState);
+                    };
+                } catch (err) {
+                    console.error("Failed to initialize PeerConnection", err);
+                }
             };
 
             const setupChannel = (channel) => {
                 channel.onopen = () => setConnState('connected');
+                channel.onclose = () => setConnState('disconnected');
                 channel.onmessage = (e) => {
                     const msg = JSON.parse(e.data);
                     setMessages(prev => [msg, ...prev]);
@@ -109,17 +115,24 @@
 
             const createOffer = async () => {
                 initPeer();
-                dataChannel.current = pc.current.createDataChannel('chat');
-                setupChannel(dataChannel.current);
-                const offer = await pc.current.createOffer();
-                await pc.current.setLocalDescription(offer);
+                try {
+                    dataChannel.current = pc.current.createDataChannel('chat');
+                    setupChannel(dataChannel.current);
+                    
+                    const offer = await pc.current.createOffer();
+                    await pc.current.setLocalDescription(offer);
+                    // The onicecandidate event will trigger to set the final sdpData
+                } catch (err) {
+                    console.error("Error creating offer:", err);
+                    alert("Could not generate code. Check your internet or browser settings.");
+                }
             };
 
             const connectToFriend = async () => {
                 if (!remoteSdp) return;
                 try {
                     const desc = new RTCSessionDescription(JSON.parse(remoteSdp));
-                    if (!pc.current) initPeer();
+                    initPeer();
                     
                     if (desc.type === 'offer') {
                         await pc.current.setRemoteDescription(desc);
@@ -129,17 +142,10 @@
                         await pc.current.setRemoteDescription(desc);
                     }
                 } catch (e) {
+                    console.error("Connection Error", e);
                     alert("Invalid Connection Code. Make sure you copied the whole text!");
                 }
             };
-
-            // Attempt auto-connect if codes exist
-            useEffect(() => {
-                if (savedSdp && savedRemoteSdp && connState === 'disconnected') {
-                    // Slight delay to ensure everything is ready
-                    setTimeout(() => connectToFriend(), 1000);
-                }
-            }, []);
 
             const joinVoiceChannel = async () => {
                 if (connState !== 'connected') {
@@ -153,10 +159,9 @@
                     
                     const offer = await pc.current.createOffer();
                     await pc.current.setLocalDescription(offer);
-                    setSdpData(JSON.stringify(pc.current.localDescription));
                     setShowConnectModal(true); 
                 } catch (err) {
-                    console.error("Mic access denied");
+                    alert("Mic access denied. Please allow microphone access to join voice.");
                 }
                 setIsJoiningVoice(false);
             };
@@ -164,6 +169,7 @@
             const leaveVoice = () => {
                 if (localStream.current) {
                     localStream.current.getTracks().forEach(track => track.stop());
+                    localStream.current = null;
                 }
                 setIsInVoiceRoom(false);
             };
@@ -222,7 +228,6 @@
 
             return (
                 <div className="flex h-screen w-full text-[#dbdee1] overflow-hidden antialiased">
-                    {/* Left Sidebar: Servers */}
                     <div className="w-[72px] bg-[#1e1f22] flex flex-col items-center py-3 space-y-2 flex-shrink-0">
                         {servers.map(server => (
                             <div 
@@ -245,7 +250,6 @@
                         </div>
                     </div>
 
-                    {/* Middle Sidebar: Channels */}
                     <div className="w-60 bg-[#2b2d31] flex flex-col flex-shrink-0">
                         <div className="h-12 px-4 flex items-center border-b border-[#1e1f22] font-bold text-white shadow-sm">
                             <span className="truncate">{servers.find(s => s.id === activeServer)?.name}</span>
@@ -273,21 +277,19 @@
                             </div>
                         </div>
 
-                        {/* Voice Status Overlay */}
                         {isInVoiceRoom && (
                             <div className="bg-[#232428] px-3 py-2 border-b border-white/5 flex items-center justify-between">
                                 <div className="flex items-center space-x-2 text-[#23a559]">
-                                    <div className="w-2 h-2 rounded-full bg-[#23a559] animate-pulse shadow-[0_0_5px_#23a559]"></div>
+                                    <div className="w-2 h-2 rounded-full bg-[#23a559] animate-pulse"></div>
                                     <span className="text-[11px] font-bold">Voice Connected</span>
                                 </div>
                                 <i data-lucide="phone-off" className="w-4 h-4 text-red-500 cursor-pointer hover:scale-110" onClick={leaveVoice}></i>
                             </div>
                         )}
 
-                        {/* Profile Footer */}
                         <div className="bg-[#232428] p-2 flex items-center space-x-2">
-                            <div className="w-8 h-8 bg-indigo-600 rounded-full flex items-center justify-center font-bold text-xs text-white">
-                                {username[0]?.toUpperCase()}
+                            <div className="w-8 h-8 bg-indigo-600 rounded-full flex items-center justify-center font-bold text-xs text-white uppercase">
+                                {username[0]}
                             </div>
                             <div className="flex-1 min-w-0">
                                 <div className="text-white text-xs font-bold truncate">{username}</div>
@@ -295,13 +297,10 @@
                                     {connState}
                                 </div>
                             </div>
-                            <div className="flex space-x-1 text-[#b5bac1]">
-                                <i data-lucide="settings" className="w-4 h-4 cursor-pointer hover:text-white" onClick={() => setShowProfileModal(true)}></i>
-                            </div>
+                            <i data-lucide="settings" className="w-4 h-4 cursor-pointer hover:text-white text-[#b5bac1]" onClick={() => setShowProfileModal(true)}></i>
                         </div>
                     </div>
 
-                    {/* Main Chat Area */}
                     <div className="flex-1 flex flex-col bg-[#313338] min-w-0">
                         <div className="h-12 px-4 flex items-center border-b border-[#1e1f22] shadow-sm">
                             <i data-lucide="hash" className="w-6 h-6 text-[#80848e] mr-2"></i>
@@ -315,12 +314,11 @@
                             </button>
                         </div>
 
-                        {/* Messages List */}
                         <div className="flex-1 overflow-y-auto p-4 flex flex-col-reverse">
                             <div className="flex flex-col space-y-4">
                                 {messages.map(msg => (
                                     <div key={msg.id} className={`flex items-start space-x-4 px-4 py-1 hover:bg-[#2e3035] -mx-4 transition-colors ${msg.system ? 'opacity-50 italic text-xs' : ''}`}>
-                                        {!msg.system && <div className="w-10 h-10 bg-[#5865f2] rounded-full flex-shrink-0 flex items-center justify-center font-bold text-white">{msg.user[0]?.toUpperCase()}</div>}
+                                        {!msg.system && <div className="w-10 h-10 bg-[#5865f2] rounded-full flex-shrink-0 flex items-center justify-center font-bold text-white uppercase">{msg.user[0]}</div>}
                                         <div className="min-w-0 flex-1">
                                             <div className="flex items-baseline space-x-2">
                                                 <span className="font-bold text-white text-[15px]">{msg.user}</span>
@@ -333,7 +331,6 @@
                             </div>
                         </div>
 
-                        {/* Chat Input */}
                         <div className="px-4 pb-6">
                             <div className="bg-[#383a40] rounded-lg px-4 py-2.5 flex items-center space-x-4">
                                 <input 
@@ -348,36 +345,39 @@
                         </div>
                     </div>
 
-                    {/* MODAL: Connect / P2P Setup */}
                     {showConnectModal && (
                         <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4 backdrop-blur-sm">
-                            <div className="bg-[#313338] w-full max-w-md rounded-xl shadow-2xl overflow-hidden border border-white/10 scale-in">
+                            <div className="bg-[#313338] w-full max-w-md rounded-xl shadow-2xl border border-white/10 scale-in">
                                 <div className="p-6 text-center">
-                                    <h2 className="text-xl font-bold text-white mb-1">Persistent Link</h2>
-                                    <p className="text-xs text-[#949ba4] mb-4">Codes are saved to your browser.</p>
+                                    <h2 className="text-xl font-bold text-white mb-1">Peer Connectivity</h2>
+                                    <p className="text-xs text-[#949ba4] mb-4">Click "Generate" then send the code to a friend.</p>
                                     <div className="space-y-4">
                                         <div className="bg-[#2b2d31] p-4 rounded-lg">
-                                            <p className="text-[10px] font-bold text-[#b5bac1] uppercase mb-2">1. Your Code</p>
-                                            {!sdpData ? (
-                                                <button onClick={createOffer} className="w-full bg-[#5865f2] py-2 rounded font-bold text-sm">Generate Invite</button>
-                                            ) : (
+                                            <p className="text-[10px] font-bold text-[#b5bac1] uppercase mb-2">1. Your Local Code</p>
+                                            <button 
+                                                onClick={createOffer} 
+                                                className={`w-full py-2 rounded font-bold text-sm mb-2 ${sdpData ? 'bg-[#4e5058]' : 'bg-[#5865f2] hover:bg-[#4752c4]'}`}
+                                            >
+                                                {sdpData ? 'Regenerate Code' : 'Generate Invite Code'}
+                                            </button>
+                                            {sdpData && (
                                                 <button 
                                                     onClick={() => { navigator.clipboard.writeText(sdpData); setCopySuccess(true); setTimeout(() => setCopySuccess(false), 1000); }}
-                                                    className="w-full bg-[#23a559] py-2 rounded font-bold text-sm"
+                                                    className="w-full bg-[#23a559] py-2 rounded font-bold text-sm text-white"
                                                 >
-                                                    {copySuccess ? 'Copied!' : 'Copy Invitation Code'}
+                                                    {copySuccess ? 'Copied to Clipboard!' : 'Copy Code'}
                                                 </button>
                                             )}
                                         </div>
                                         <div className="bg-[#2b2d31] p-4 rounded-lg">
-                                            <p className="text-[10px] font-bold text-[#b5bac1] uppercase mb-2">2. Paste Friend's Code</p>
+                                            <p className="text-[10px] font-bold text-[#b5bac1] uppercase mb-2">2. Friend's Response Code</p>
                                             <textarea 
                                                 value={remoteSdp}
                                                 onChange={(e) => setRemoteSdp(e.target.value)}
-                                                className="w-full bg-[#1e1f22] p-2 text-[10px] h-20 rounded text-[#dbdee1] outline-none font-mono"
-                                                placeholder="Friend's code goes here..."
+                                                className="w-full bg-[#1e1f22] p-2 text-[10px] h-20 rounded text-[#dbdee1] outline-none font-mono resize-none border border-white/5"
+                                                placeholder="Paste the code your friend sent you here..."
                                             />
-                                            <button onClick={connectToFriend} className="w-full bg-[#5865f2] mt-2 py-2 rounded font-bold text-sm">Apply & Link</button>
+                                            <button onClick={connectToFriend} className="w-full bg-[#5865f2] mt-2 py-2 rounded font-bold text-sm hover:bg-[#4752c4]">Connect with Friend</button>
                                         </div>
                                     </div>
                                     <div className="mt-6 flex justify-between items-center">
@@ -389,15 +389,13 @@
                         </div>
                     )}
 
-                    {/* MODAL: Create Server */}
                     {showServerModal && (
                         <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4 backdrop-blur-sm">
                             <div className="bg-[#313338] w-full max-w-sm rounded-xl p-6 border border-white/10 scale-in text-center">
                                 <h2 className="text-xl font-bold text-white mb-2">Create a Server</h2>
-                                <p className="text-[#949ba4] text-sm mb-6">Give your new server a name.</p>
                                 <input id="server-name-input" autoFocus className="w-full bg-[#1e1f22] p-3 rounded text-white outline-none mb-4" placeholder="Server Name" />
                                 <div className="flex space-x-3">
-                                    <button onClick={() => setShowServerModal(false)} className="flex-1 py-2 text-white font-bold">Cancel</button>
+                                    <button onClick={() => setShowServerModal(false)} className="flex-1 py-2 text-[#949ba4] font-bold">Cancel</button>
                                     <button 
                                         onClick={() => addServer(document.getElementById('server-name-input').value)}
                                         className="flex-1 bg-[#5865f2] py-2 rounded font-bold text-white"
@@ -409,7 +407,6 @@
                         </div>
                     )}
 
-                    {/* MODAL: Edit Profile */}
                     {showProfileModal && (
                         <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4 backdrop-blur-sm">
                             <div className="bg-[#313338] w-full max-w-sm rounded-xl p-6 border border-white/10 scale-in text-center">
@@ -420,12 +417,7 @@
                                     className="w-full bg-[#1e1f22] p-3 rounded text-white outline-none mb-4"
                                     placeholder="Change Username"
                                 />
-                                <button 
-                                    onClick={() => setShowProfileModal(false)}
-                                    className="w-full bg-[#5865f2] py-2 rounded font-bold text-white"
-                                >
-                                    Save Changes
-                                </button>
+                                <button onClick={() => setShowProfileModal(false)} className="w-full bg-[#5865f2] py-2 rounded font-bold text-white">Save Changes</button>
                             </div>
                         </div>
                     )}
@@ -435,7 +427,6 @@
 
         const root = ReactDOM.createRoot(document.getElementById('root'));
         root.render(<App />);
-        
         setInterval(() => lucide.createIcons(), 1000);
     </script>
 </body>
