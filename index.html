@@ -1,432 +1,283 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>P2P Chat & Voice</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://unpkg.com/lucide@latest"></script>
-    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
-    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
-    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-    <style>
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-        body { font-family: 'Inter', sans-serif; background-color: #313338; margin: 0; color: #dbdee1; overflow: hidden; }
-        .scale-in { animation: scaleIn 0.2s ease-out; }
-        @keyframes scaleIn { from { transform: scale(0.95); opacity: 0; } to { transform: scale(1); opacity: 1; } }
-        ::-webkit-scrollbar { width: 8px; }
-        ::-webkit-scrollbar-track { background: #2b2d31; }
-        ::-webkit-scrollbar-thumb { background: #1e1f22; border-radius: 4px; }
-    </style>
-</head>
-<body>
-    <div id="root"></div>
+import React, { useState, useEffect, useRef } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, onAuthStateChanged, signInAnonymously, signInWithCustomToken } from 'firebase/auth';
+import { getFirestore, collection, onSnapshot, doc, addDoc, serverTimestamp, query } from 'firebase/firestore';
+import { 
+  Send, Plus, User, ShieldAlert, Clock, Sparkles, 
+  LayoutGrid, MessageSquare, Bell, Search, MoreVertical,
+  Zap, Smile, Paperclip
+} from 'lucide-react';
 
-    <script type="text/babel">
-        const { useState, useEffect, useRef } = React;
+const firebaseConfig = JSON.parse(__firebase_config);
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'discord-clone-v2';
 
-        const App = () => {
-            // Persistence
-            const [username, setUsername] = useState(localStorage.getItem('p2p-username') || '');
-            const [isUsernameSet, setIsUsernameSet] = useState(!!localStorage.getItem('p2p-username'));
-            const [messages, setMessages] = useState(JSON.parse(localStorage.getItem('p2p-messages')) || []);
-            const [servers, setServers] = useState(JSON.parse(localStorage.getItem('p2p-servers')) || [{ id: 'home', name: 'Home', icon: 'github' }]);
-            const [activeServer, setActiveServer] = useState('home');
-            
-            // Connection State
-            const [connState, setConnState] = useState('disconnected');
-            const [localSdp, setLocalSdp] = useState(localStorage.getItem('p2p-local-sdp') || '');
-            const [remoteSdp, setRemoteSdp] = useState(localStorage.getItem('p2p-remote-sdp') || '');
-            const [isGenerating, setIsGenerating] = useState(false);
-            const [copySuccess, setCopySuccess] = useState(false);
-            const [inputText, setInputText] = useState('');
-            const [logs, setLogs] = useState(['App started.']);
+const App = () => {
+  // --- Auth & Safety State ---
+  const [user, setUser] = useState(null);
+  const [isBanned, setIsBanned] = useState(false);
+  const [activeTimeout, setActiveTimeout] = useState(null);
 
-            // UI Modals
-            const [showConnectModal, setShowConnectModal] = useState(false);
-            const [showServerModal, setShowServerModal] = useState(false);
-            const [showProfileModal, setShowProfileModal] = useState(false);
+  // --- UI State ---
+  const [messages, setMessages] = useState([]);
+  const [inputText, setInputText] = useState('');
+  const messagesEndRef = useRef(null);
 
-            // Voice State
-            const [isJoiningVoice, setIsJoiningVoice] = useState(false);
-            const [isInVoiceRoom, setIsInVoiceRoom] = useState(false);
+  // --- Step 1: Handle Authentication FIRST ---
+  useEffect(() => {
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (err) {
+        console.error("Auth initialization failed:", err);
+      }
+    };
+    initAuth();
+    const unsubscribe = onAuthStateChanged(auth, (u) => {
+      setUser(u);
+    });
+    return () => unsubscribe();
+  }, []);
 
-            const pc = useRef(null);
-            const dataChannel = useRef(null);
-            const localStream = useRef(null);
-            const remoteAudio = useRef(new Audio());
+  // --- Step 2: Only setup listeners AFTER user is authenticated ---
+  useEffect(() => {
+    if (!user) return;
 
-            const addLog = (msg) => setLogs(prev => [...prev.slice(-4), `> ${msg}`]);
+    // Guard all operations with user check
+    const setupListeners = () => {
+      // Listen for Bans
+      const banRef = doc(db, 'artifacts', appId, 'public', 'data', 'bans', user.uid);
+      const unsubBans = onSnapshot(banRef, (docSnap) => {
+        setIsBanned(docSnap.exists());
+      }, (err) => console.error("Ban listener error:", err));
 
-            useEffect(() => { localStorage.setItem('p2p-username', username); }, [username]);
-            useEffect(() => { localStorage.setItem('p2p-messages', JSON.stringify(messages)); }, [messages]);
-            useEffect(() => { localStorage.setItem('p2p-servers', JSON.stringify(servers)); }, [servers]);
-            useEffect(() => { localStorage.setItem('p2p-local-sdp', localSdp); }, [localSdp]);
-            useEffect(() => { localStorage.setItem('p2p-remote-sdp', remoteSdp); }, [remoteSdp]);
+      // Listen for Timeouts
+      const timeoutRef = doc(db, 'artifacts', appId, 'public', 'data', 'timeouts', user.uid);
+      const unsubTimeouts = onSnapshot(timeoutRef, (docSnap) => {
+        if (docSnap.exists()) {
+          const data = docSnap.data();
+          if (data.expiresAt > Date.now()) {
+            setActiveTimeout(data.expiresAt);
+          } else {
+            setActiveTimeout(null);
+          }
+        } else {
+          setActiveTimeout(null);
+        }
+      }, (err) => console.error("Timeout listener error:", err));
 
-            const initPeer = () => {
-                if (pc.current) return;
-                addLog("Initializing Peer Connection...");
-                pc.current = new RTCPeerConnection({ 
-                    iceServers: [
-                        { urls: 'stun:stun.l.google.com:19302' },
-                        { urls: 'stun:stun1.l.google.com:19302' },
-                        { urls: 'stun:stun2.l.google.com:19302' }
-                    ] 
-                });
+      // Listen for Global Messages (Simple query to avoid index errors)
+      const msgCol = collection(db, 'artifacts', appId, 'public', 'data', 'messages');
+      const unsubMsgs = onSnapshot(msgCol, (snap) => {
+        const data = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+        // Sort in memory to avoid "missing index" errors and permission issues with complex queries
+        setMessages(data.sort((a, b) => (a.timestamp?.seconds || 0) - (b.timestamp?.seconds || 0)));
+      }, (err) => console.error("Message listener error:", err));
 
-                pc.current.onicecandidate = (e) => {
-                    if (!e.candidate && pc.current.localDescription) {
-                        addLog("ICE Gathering Complete.");
-                        setLocalSdp(JSON.stringify(pc.current.localDescription));
-                        setIsGenerating(false);
-                    }
-                };
+      return () => {
+        unsubBans();
+        unsubTimeouts();
+        unsubMsgs();
+      };
+    };
 
-                pc.current.onconnectionstatechange = () => {
-                    setConnState(pc.current.connectionState);
-                    addLog(`Connection State: ${pc.current.connectionState}`);
-                    if (pc.current.connectionState === 'connected') {
-                        setTimeout(() => setShowConnectModal(false), 1500);
-                    }
-                };
+    const cleanup = setupListeners();
+    return () => cleanup && cleanup();
+  }, [user]);
 
-                pc.current.ondatachannel = (e) => {
-                    addLog("Data Channel received.");
-                    dataChannel.current = e.channel;
-                    setupDataChannel(e.channel);
-                };
+  // Handle timeout countdown
+  useEffect(() => {
+    if (!activeTimeout) return;
+    const interval = setInterval(() => {
+      if (Date.now() >= activeTimeout) setActiveTimeout(null);
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [activeTimeout]);
 
-                pc.current.ontrack = (e) => {
-                    addLog("Voice track received.");
-                    remoteAudio.current.srcObject = e.streams[0];
-                    remoteAudio.current.play().catch(console.error);
-                    setIsInVoiceRoom(true);
-                };
-            };
+  // Scroll to bottom when messages update
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages]);
 
-            const setupDataChannel = (channel) => {
-                channel.onopen = () => {
-                    setConnState('connected');
-                    addLog("Chat Channel Open.");
-                };
-                channel.onclose = () => setConnState('disconnected');
-                channel.onmessage = (e) => {
-                    try {
-                        const msg = JSON.parse(e.data);
-                        setMessages(prev => [msg, ...prev]);
-                    } catch (err) { console.error("Message error", err); }
-                };
-            };
+  const sendMessage = async () => {
+    if (!inputText.trim() || !user || activeTimeout || isBanned) return;
+    
+    try {
+      await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'messages'), {
+        content: inputText,
+        user: `Explorer-${user.uid.slice(0, 4)}`,
+        userId: user.uid,
+        timestamp: serverTimestamp(),
+        color: ['#6366f1', '#ec4899', '#f59e0b', '#10b981'][Math.floor(Math.random() * 4)]
+      });
+      setInputText('');
+    } catch (err) {
+      console.error("Failed to send message:", err);
+    }
+  };
 
-            const generateInvite = async () => {
-                setIsGenerating(true);
-                initPeer();
-                try {
-                    dataChannel.current = pc.current.createDataChannel('chat');
-                    setupDataChannel(dataChannel.current);
-                    const offer = await pc.current.createOffer();
-                    await pc.current.setLocalDescription(offer);
-                    addLog("Offer created. Waiting for network...");
-                    
-                    setTimeout(() => {
-                        if (isGenerating) {
-                            addLog("Forcing code display (Timeout).");
-                            setLocalSdp(JSON.stringify(pc.current.localDescription));
-                            setIsGenerating(false);
-                        }
-                    }, 4000);
-                } catch (err) {
-                    setIsGenerating(false);
-                    addLog("Error generating invite.");
-                }
-            };
+  if (isBanned) {
+    return (
+      <div className="h-screen w-full bg-[#0f172a] flex items-center justify-center p-6 text-center">
+        <div className="bg-slate-900/50 backdrop-blur-xl p-10 rounded-3xl border border-red-500/20 shadow-2xl shadow-red-500/10">
+          <ShieldAlert size={80} className="text-red-500 mx-auto mb-6 animate-pulse" />
+          <h1 className="text-3xl font-black text-white mb-4 tracking-tight">System Restricted</h1>
+          <p className="text-slate-400 max-w-xs mx-auto">Access to this frequency has been terminated by the moderator team.</p>
+        </div>
+      </div>
+    );
+  }
 
-            const applyFriendCode = async () => {
-                if (!remoteSdp) return;
-                addLog("Applying remote code...");
-                try {
-                    const remoteDesc = JSON.parse(remoteSdp);
-                    initPeer();
-                    
-                    await pc.current.setRemoteDescription(new RTCSessionDescription(remoteDesc));
-                    addLog("Remote code applied.");
-                    
-                    if (remoteDesc.type === 'offer') {
-                        addLog("Received Offer. Generating Answer...");
-                        const answer = await pc.current.createAnswer();
-                        await pc.current.setLocalDescription(answer);
-                        // Answer is generated, ICE handler will update localSdp automatically
-                    }
-                } catch (err) {
-                    addLog("Failed to apply code.");
-                    alert("Invalid Code format.");
-                }
-            };
+  return (
+    <div className="flex h-screen w-full bg-[#020617] text-slate-200 font-sans overflow-hidden">
+      <div className="fixed top-[-10%] left-[-10%] w-[40%] h-[40%] bg-indigo-600/20 blur-[120px] rounded-full" />
+      <div className="fixed bottom-[-10%] right-[-10%] w-[40%] h-[40%] bg-pink-600/20 blur-[120px] rounded-full" />
 
-            const joinVoiceChannel = async () => {
-                if (connState !== 'connected') {
-                    alert("Connect with a friend first!");
-                    return;
-                }
-                setIsJoiningVoice(true);
-                try {
-                    localStream.current = await navigator.mediaDevices.getUserMedia({ audio: true });
-                    localStream.current.getTracks().forEach(track => pc.current.addTrack(track, localStream.current));
-                    const offer = await pc.current.createOffer();
-                    await pc.current.setLocalDescription(offer);
-                    setShowConnectModal(true); 
-                } catch (err) {
-                    alert("Mic access denied.");
-                }
-                setIsJoiningVoice(false);
-            };
+      <div className="w-24 flex flex-col items-center py-8 z-10 border-r border-white/5 bg-slate-950/20 backdrop-blur-md">
+        <div className="w-14 h-14 bg-gradient-to-tr from-indigo-500 to-purple-500 rounded-2xl flex items-center justify-center text-white mb-10 shadow-lg shadow-indigo-500/20">
+          <Zap size={28} fill="currentColor" />
+        </div>
+        
+        <nav className="flex flex-col space-y-6">
+          <div className="p-3 text-indigo-400 bg-indigo-400/10 rounded-xl cursor-pointer"><LayoutGrid size={24} /></div>
+          <div className="p-3 text-slate-500 hover:text-white transition-colors cursor-pointer"><MessageSquare size={24} /></div>
+          <div className="p-3 text-slate-500 hover:text-white transition-colors cursor-pointer relative">
+            <Bell size={24} />
+            <div className="absolute top-2 right-2 w-2 h-2 bg-pink-500 rounded-full border-2 border-[#020617]" />
+          </div>
+          <div className="p-3 text-slate-500 hover:text-white transition-colors cursor-pointer"><Sparkles size={24} /></div>
+        </nav>
 
-            const leaveVoice = () => {
-                if (localStream.current) {
-                    localStream.current.getTracks().forEach(track => track.stop());
-                    localStream.current = null;
-                }
-                setIsInVoiceRoom(false);
-            };
+        <div className="mt-auto">
+          <div className="w-12 h-12 rounded-full border-2 border-slate-800 p-0.5">
+            <div className="w-full h-full rounded-full bg-slate-700 flex items-center justify-center font-bold text-xs uppercase">
+              {user ? user.uid.slice(0, 2) : '??'}
+            </div>
+          </div>
+        </div>
+      </div>
 
-            const sendMessage = () => {
-                if (!inputText.trim()) return;
-                const msg = {
-                    id: Date.now(),
-                    user: username,
-                    content: inputText,
-                    timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-                };
-                if (dataChannel.current?.readyState === 'open') {
-                    dataChannel.current.send(JSON.stringify(msg));
-                }
-                setMessages(prev => [msg, ...prev]);
-                setInputText('');
-            };
+      <div className="flex-1 flex flex-col relative z-10">
+        <header className="h-20 px-8 flex items-center justify-between border-b border-white/5">
+          <div>
+            <h2 className="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-white to-slate-400">Public Frequency</h2>
+            <p className="text-[10px] text-slate-500 uppercase tracking-[0.2em] font-black mt-1">Status: {user ? 'Operational' : 'Syncing...'}</p>
+          </div>
+          <div className="flex items-center space-x-4 bg-slate-900/40 px-4 py-2 rounded-full border border-white/5">
+            <Search size={18} className="text-slate-500" />
+            <input type="text" placeholder="Search logs..." className="bg-transparent outline-none text-sm w-40" />
+          </div>
+        </header>
 
-            const resetHandshake = () => {
-                setLocalSdp('');
-                setRemoteSdp('');
-                setConnState('disconnected');
-                pc.current = null;
-                addLog("Handshake reset.");
-            };
-
-            const addServer = (name) => {
-                if(!name.trim()) return;
-                const newServer = { id: Date.now().toString(), name, icon: 'hash' };
-                setServers([...servers, newServer]);
-                setShowServerModal(false);
-            };
-
-            if (!isUsernameSet) {
-                return (
-                    <div className="flex h-screen w-full items-center justify-center bg-[#1e1f22]">
-                        <div className="bg-[#313338] p-8 rounded-lg shadow-xl w-80 text-center scale-in border border-white/5">
-                            <h2 className="text-xl font-bold mb-4 text-white">Choose a Name</h2>
-                            <input 
-                                value={username} 
-                                onChange={e => setUsername(e.target.value)}
-                                onKeyDown={e => e.key === 'Enter' && username && setIsUsernameSet(true)}
-                                className="w-full bg-[#1e1f22] p-2 rounded mb-4 outline-none border border-white/10 text-white" 
-                            />
-                            <button 
-                                onClick={() => username && setIsUsernameSet(true)}
-                                className="w-full bg-[#5865f2] py-2 rounded font-bold hover:bg-[#4752c4] text-white"
-                            >
-                                Start Chatting
-                            </button>
-                        </div>
-                    </div>
-                );
-            }
-
+        <div className="flex-1 overflow-y-auto px-8 py-6 space-y-8 scroll-smooth">
+          {messages.map((msg, idx) => {
+            const isMe = msg.userId === user?.uid;
             return (
-                <div className="flex h-screen w-full select-none overflow-hidden">
-                    {/* Servers Sidebar */}
-                    <div className="w-[72px] bg-[#1e1f22] flex flex-col items-center py-3 space-y-2 flex-shrink-0">
-                        {servers.map(server => (
-                            <div 
-                                key={server.id}
-                                onClick={() => setActiveServer(server.id)}
-                                className={`w-12 h-12 rounded-[24px] flex items-center justify-center cursor-pointer transition-all duration-200 group relative
-                                    ${activeServer === server.id ? 'rounded-[16px] bg-[#5865f2] text-white' : 'bg-[#313338] text-[#23a559] hover:rounded-[16px] hover:bg-[#23a559] hover:text-white'}
-                                `}
-                            >
-                                <i data-lucide={server.icon || 'hash'} className="w-6 h-6"></i>
-                                {activeServer === server.id && <div className="absolute -left-3 w-2 h-8 bg-white rounded-r-full" />}
-                            </div>
-                        ))}
-                        <div className="w-8 h-[2px] bg-[#35363c] rounded-full mx-auto" />
-                        <div onClick={() => setShowServerModal(true)} className="w-12 h-12 bg-[#313338] rounded-[24px] flex items-center justify-center text-[#23a559] hover:bg-[#23a559] hover:text-white hover:rounded-[16px] transition-all cursor-pointer">
-                            <i data-lucide="plus"></i>
-                        </div>
-                    </div>
-
-                    {/* Channels Sidebar */}
-                    <div className="w-60 bg-[#2b2d31] flex flex-col flex-shrink-0 border-r border-black/20">
-                        <div className="h-12 px-4 flex items-center border-b border-[#1e1f22] font-bold text-white">
-                            <span className="truncate">{servers.find(s => s.id === activeServer)?.name}</span>
-                        </div>
-                        <div className="flex-1 p-2 space-y-4">
-                            <div>
-                                <div className="text-[11px] uppercase font-bold text-[#949ba4] px-2 mb-2 tracking-wider">Text Channels</div>
-                                <div className="bg-[#3f4147] text-white flex items-center px-2 py-1.5 rounded-md cursor-pointer">
-                                    <i data-lucide="hash" className="w-4 h-4 mr-2 opacity-50"></i>
-                                    <span className="font-medium text-sm">general</span>
-                                </div>
-                            </div>
-                            <div>
-                                <div className="text-[11px] uppercase font-bold text-[#949ba4] px-2 mb-2 tracking-wider">Voice Channels</div>
-                                <div onClick={joinVoiceChannel} className={`flex items-center px-2 py-1.5 rounded-md cursor-pointer transition-colors group ${isInVoiceRoom ? 'bg-[#3f4147] text-white' : 'hover:bg-[#35373c] text-[#949ba4] hover:text-[#dbdee1]'}`}>
-                                    <i data-lucide="volume-2" className="w-4 h-4 mr-2 opacity-50"></i>
-                                    <span className="font-medium text-sm">Voice Room</span>
-                                    {isJoiningVoice && <i data-lucide="loader-2" className="w-3 h-3 ml-auto animate-spin"></i>}
-                                </div>
-                            </div>
-                        </div>
-
-                        {isInVoiceRoom && (
-                            <div className="bg-[#232428] px-3 py-2 border-b border-white/5 flex items-center justify-between">
-                                <div className="flex items-center space-x-2 text-[#23a559]">
-                                    <div className="w-2 h-2 rounded-full bg-[#23a559] animate-pulse"></div>
-                                    <span className="text-[10px] font-bold uppercase">Connected</span>
-                                </div>
-                                <i data-lucide="phone-off" className="w-4 h-4 text-red-500 cursor-pointer hover:scale-110" onClick={leaveVoice}></i>
-                            </div>
-                        )}
-
-                        <div className="bg-[#232428] p-2 flex items-center space-x-2">
-                            <div className="w-8 h-8 bg-[#5865f2] rounded-full flex items-center justify-center font-bold text-xs text-white uppercase">{username[0]}</div>
-                            <div className="flex-1 min-w-0">
-                                <div className="text-white text-xs font-bold truncate">{username}</div>
-                                <div className={`text-[10px] uppercase font-bold ${connState === 'connected' ? 'text-[#23a559]' : 'text-[#949ba4]'}`}>
-                                    {connState}
-                                </div>
-                            </div>
-                            <i data-lucide="settings" className="w-4 h-4 cursor-pointer hover:text-white text-[#b5bac1]" onClick={() => setShowProfileModal(true)}></i>
-                        </div>
-                    </div>
-
-                    {/* Chat Window */}
-                    <div className="flex-1 flex flex-col bg-[#313338] min-w-0">
-                        <div className="h-12 border-b border-black/20 flex items-center px-4 shadow-sm">
-                            <i data-lucide="hash" className="w-5 h-5 text-[#80848e] mr-2"></i>
-                            <span className="font-bold text-white text-sm">general</span>
-                            <div className="flex-1" />
-                            <button 
-                                onClick={() => setShowConnectModal(true)}
-                                className={`px-3 py-1 rounded text-xs font-bold transition-all flex items-center ${connState === 'connected' ? 'bg-[#23a559]/20 text-[#23a559]' : 'bg-[#5865f2] text-white hover:bg-[#4752c4]'}`}
-                            >
-                                <i data-lucide="link" className="w-3 h-3 mr-1.5"></i>
-                                {connState === 'connected' ? 'Connected' : 'Connect'}
-                            </button>
-                        </div>
-                        
-                        <div className="flex-1 overflow-y-auto p-4 flex flex-col-reverse space-y-reverse space-y-4">
-                            {messages.map(m => (
-                                <div key={m.id} className="flex items-start space-x-3 p-1 rounded hover:bg-black/5">
-                                    <div className="w-10 h-10 bg-[#5865f2] rounded-full flex-shrink-0 flex items-center justify-center font-bold uppercase text-white">{m.user[0]}</div>
-                                    <div>
-                                        <div className="flex items-baseline space-x-2">
-                                            <span className="font-bold text-white text-sm">{m.user}</span>
-                                            <span className="text-[10px] text-[#949ba4]">{m.timestamp}</span>
-                                        </div>
-                                        <p className="text-sm text-[#dbdee1] break-words">{m.content}</p>
-                                    </div>
-                                </div>
-                            ))}
-                        </div>
-
-                        <div className="p-4">
-                            <div className="bg-[#383a40] rounded-lg px-4 py-2.5 flex items-center shadow-inner">
-                                <input 
-                                    className="flex-1 bg-transparent outline-none text-sm text-[#dbdee1]" 
-                                    placeholder="Message #general" 
-                                    value={inputText}
-                                    onChange={e => setInputText(e.target.value)}
-                                    onKeyDown={e => e.key === 'Enter' && sendMessage()}
-                                />
-                                <button onClick={sendMessage} className="text-[#b5bac1] hover:text-white transition-colors">
-                                    <i data-lucide="send" className="w-5 h-5"></i>
-                                </button>
-                            </div>
-                        </div>
-                    </div>
-
-                    {/* Connection Modal */}
-                    {showConnectModal && (
-                        <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4 backdrop-blur-sm">
-                            <div className="bg-[#313338] w-full max-w-md rounded-xl p-6 shadow-2xl border border-white/5 scale-in flex flex-col max-h-[90vh]">
-                                <h2 className="text-xl font-bold text-center mb-2 text-white flex items-center justify-center">
-                                    <i data-lucide="link" className="w-5 h-5 mr-2"></i> P2P Handshake
-                                </h2>
-                                
-                                <div className="space-y-4 overflow-y-auto pr-1 mt-4">
-                                    <div className="bg-[#2b2d31] p-4 rounded-lg border border-white/5">
-                                        <div className="flex items-center space-x-2 mb-3">
-                                            <div className="w-5 h-5 rounded-full bg-[#5865f2] text-xs flex items-center justify-center font-bold">1</div>
-                                            <p className="text-xs font-bold text-white uppercase tracking-tight">Your Code</p>
-                                        </div>
-                                        <button onClick={generateInvite} disabled={isGenerating} className={`w-full py-2 rounded font-bold text-sm text-white ${isGenerating ? 'bg-gray-600 animate-pulse' : 'bg-[#5865f2] hover:bg-[#4752c4]'}`}>
-                                            {isGenerating ? 'Finding Network...' : localSdp ? 'Regenerate Code' : 'Generate My Code'}
-                                        </button>
-                                        {localSdp && !isGenerating && (
-                                            <button onClick={() => { navigator.clipboard.writeText(localSdp); setCopySuccess(true); setTimeout(() => setCopySuccess(false), 2000); }} className="w-full mt-2 bg-[#23a559] py-2 rounded font-bold text-sm flex items-center justify-center text-white">
-                                                <i data-lucide={copySuccess ? "check" : "copy"} className="w-4 h-4 mr-2"></i> {copySuccess ? 'Copied!' : 'Copy & Send to Friend'}
-                                            </button>
-                                        )}
-                                    </div>
-
-                                    <div className="bg-[#2b2d31] p-4 rounded-lg border border-white/5">
-                                        <div className="flex items-center space-x-2 mb-3">
-                                            <div className="w-5 h-5 rounded-full bg-[#5865f2] text-xs flex items-center justify-center font-bold">2</div>
-                                            <p className="text-xs font-bold text-white uppercase tracking-tight">Friend's Code</p>
-                                        </div>
-                                        <textarea className="w-full bg-[#1e1f22] p-2 rounded h-20 text-[10px] font-mono outline-none border border-white/5 resize-none text-[#dbdee1]" placeholder="Paste friend's code here..." value={remoteSdp} onChange={e => setRemoteSdp(e.target.value)} />
-                                        <button onClick={applyFriendCode} className="w-full mt-2 bg-white text-black py-2 rounded font-bold text-sm">Apply Friend's Code</button>
-                                    </div>
-
-                                    <div className="bg-[#2b2d31] p-4 rounded-lg border border-white/5">
-                                        <div className="flex items-center space-x-2 mb-2 text-[#23a559]">
-                                            <div className="w-5 h-5 rounded-full bg-[#23a559] text-xs flex items-center justify-center font-bold text-white">3</div>
-                                            <p className="text-xs font-bold uppercase tracking-tight">Check Status</p>
-                                        </div>
-                                        <div className="bg-black/20 p-2 rounded text-[10px] font-mono text-gray-400 space-y-1">
-                                            {logs.map((log, i) => <div key={i} className="truncate">{log}</div>)}
-                                        </div>
-                                    </div>
-                                </div>
-
-                                <div className="mt-6 flex justify-between items-center text-xs">
-                                    <button onClick={resetHandshake} className="text-red-400 hover:text-red-300 font-bold transition-colors">Reset Link</button>
-                                    <button onClick={() => setShowConnectModal(false)} className="px-4 py-1.5 bg-[#4e5058] rounded text-white font-bold hover:bg-[#6d6f78]">Close</button>
-                                </div>
-                            </div>
-                        </div>
-                    )}
-
-                    {/* Standard Modals */}
-                    {showServerModal && (
-                        <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4">
-                            <div className="bg-[#313338] w-full max-w-sm rounded-xl p-6 border border-white/10 scale-in text-center">
-                                <h2 className="text-xl font-bold text-white mb-4 uppercase text-sm tracking-widest">Create Server</h2>
-                                <input id="sn" autoFocus className="w-full bg-[#1e1f22] p-3 rounded text-white outline-none mb-6 border border-white/5" placeholder="Server Name" />
-                                <div className="flex space-x-3">
-                                    <button onClick={() => setShowServerModal(false)} className="flex-1 py-2 text-[#949ba4] font-bold">Cancel</button>
-                                    <button onClick={() => addServer(document.getElementById('sn').value)} className="flex-1 bg-[#23a559] py-2 rounded font-bold text-white">Create</button>
-                                </div>
-                            </div>
-                        </div>
-                    )}
+              <div key={msg.id || idx} className={`flex items-end space-x-3 ${isMe ? 'flex-row-reverse space-x-reverse' : ''}`}>
+                <div className={`w-8 h-8 rounded-lg flex items-center justify-center font-bold text-[10px] shadow-lg text-white`} 
+                     style={{ backgroundColor: msg.color || '#6366f1' }}>
+                  {msg.user?.[0] || 'E'}
                 </div>
+                <div className={`max-w-[70%] ${isMe ? 'items-end' : 'items-start'} flex flex-col`}>
+                  <div className={`px-5 py-3 rounded-2xl text-sm ${
+                    isMe 
+                    ? 'bg-indigo-600 text-white rounded-br-none shadow-lg shadow-indigo-600/20' 
+                    : 'bg-slate-800/80 backdrop-blur-sm text-slate-100 rounded-bl-none border border-white/5'
+                  }`}>
+                    {msg.content}
+                  </div>
+                  <div className="mt-1 flex items-center space-x-2 text-[9px] font-bold uppercase text-slate-500 tracking-wider">
+                    <span>{msg.user}</span>
+                    <span>•</span>
+                    <span>{msg.timestamp?.seconds ? new Date(msg.timestamp.seconds * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'Syncing'}</span>
+                  </div>
+                </div>
+              </div>
             );
-        };
+          })}
+          <div ref={messagesEndRef} />
+        </div>
 
-        const root = ReactDOM.createRoot(document.getElementById('root'));
-        root.render(<App />);
-        setInterval(() => window.lucide && window.lucide.createIcons(), 1000);
-    </script>
-</body>
-</html>
+        <div className="p-8 pt-0">
+          <div className="max-w-4xl mx-auto relative">
+            {activeTimeout ? (
+              <div className="w-full bg-slate-900/80 backdrop-blur-xl border border-amber-500/30 rounded-2xl p-6 flex items-center space-x-6">
+                <div className="w-12 h-12 bg-amber-500/10 rounded-xl flex items-center justify-center text-amber-500">
+                  <Clock size={24} />
+                </div>
+                <div>
+                  <h4 className="font-bold text-amber-500">Cooling Down</h4>
+                  <p className="text-xs text-slate-500">Transmission paused for {Math.max(0, Math.ceil((activeTimeout - Date.now()) / 1000))}s</p>
+                </div>
+              </div>
+            ) : (
+              <div className="relative flex items-center">
+                <div className="absolute left-4 flex space-x-2 text-slate-500">
+                  <Plus className="cursor-pointer hover:text-white transition-colors" size={20} />
+                  <div className="w-[1px] h-5 bg-white/10 mx-1" />
+                </div>
+                
+                <input 
+                  value={inputText}
+                  onChange={(e) => setInputText(e.target.value)}
+                  onKeyDown={(e) => e.key === 'Enter' && sendMessage()}
+                  disabled={!user}
+                  placeholder={user ? "Type a message..." : "Authenticating frequency..."}
+                  className="w-full bg-slate-900/60 backdrop-blur-xl border border-white/5 rounded-2xl py-5 pl-16 pr-32 outline-none focus:border-indigo-500/50 focus:ring-4 focus:ring-indigo-500/5 transition-all text-sm shadow-2xl disabled:opacity-50"
+                />
+
+                <div className="absolute right-3 flex items-center space-x-2">
+                  <Smile className="text-slate-500 cursor-pointer hover:text-white transition-colors" size={20} />
+                  <Paperclip className="text-slate-500 cursor-pointer hover:text-white transition-colors" size={20} />
+                  <button 
+                    onClick={sendMessage}
+                    disabled={!user || !inputText.trim()}
+                    className="bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-700 text-white p-2.5 rounded-xl transition-all shadow-lg shadow-indigo-600/30"
+                  >
+                    <Send size={18} />
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      <div className="w-80 bg-slate-950/20 backdrop-blur-md border-l border-white/5 p-6 hidden xl:flex flex-col">
+        <div className="bg-slate-900/40 rounded-2xl p-6 border border-white/5 mb-6">
+          <div className="flex items-center justify-between mb-6">
+            <span className="text-xs font-black uppercase tracking-widest text-slate-500">Profile</span>
+            <MoreVertical size={16} className="text-slate-500" />
+          </div>
+          <div className="flex flex-col items-center text-center">
+            <div className="w-20 h-20 bg-gradient-to-tr from-indigo-500 to-pink-500 rounded-2xl mb-4 shadow-xl" />
+            <h3 className="font-bold text-lg">Explorer-{user ? user.uid.slice(0, 4) : '....'}</h3>
+            <p className="text-xs text-indigo-400 font-bold mt-1 uppercase tracking-tighter">Status: Authorized</p>
+          </div>
+        </div>
+
+        <div className="flex-1 overflow-y-auto">
+          <h4 className="text-[10px] font-black uppercase text-slate-500 tracking-widest mb-4">Frequency Stats</h4>
+          <div className="space-y-4 text-xs">
+            <div className="flex justify-between items-center p-3 bg-white/5 rounded-xl">
+              <span className="text-slate-400">Active Nodes</span>
+              <span className="text-green-400 font-mono">1</span>
+            </div>
+            <div className="flex justify-between items-center p-3 bg-white/5 rounded-xl">
+              <span className="text-slate-400">Total Packets</span>
+              <span className="text-indigo-400 font-mono">{messages.length}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default App;
